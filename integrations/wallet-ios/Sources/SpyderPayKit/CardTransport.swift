@@ -39,7 +39,7 @@ public enum CardProtocol {
         guard (8...72).contains(sig.count),sig.first==0x30 else {throw WalletError.unsupportedCard};return sig
     }
 }
-#if canImport(CoreNFC) && os(iOS)
+#if canImport(CoreNFC) && os(iOS) && !targetEnvironment(macCatalyst)
 import CoreNFC
 /// Use only a tag from a foreground NFCTagReaderSession, with the integrator's registered AID
 /// in Info.plist. The session delegate must connect to the intended ISO7816 tag first.

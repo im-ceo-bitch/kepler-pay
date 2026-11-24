@@ -1007,3 +1007,83 @@ def test_v11_velocity_across_accounts_for_same_owner(engine):
     with engine._connect() as conn,conn.transaction():
         with pytest.raises(PaymentError,match='bank_velocity_or_amount_limit'):
             Compliance(engine).enforce(conn,p,second,1)
+
+
+def test_v12_activity_owner_scope_and_signed_amount(engine):
+    from spyderpay_core.postgres.customer_activity import customer_activity
+    a,b,m=create(engine)
+    pa=identity_for(engine);pb=identity_for(engine,owner='bob',sub='external-bob')
+    invoice=engine.create_invoice(merchant,m,4000,'v12-invoice-activity-001')
+    paid=engine.pay_invoice(alice,invoice['id'],a,'v12-pay-activity-001')
+    result=customer_activity(engine,pa,a)
+    assert result['account_id']==a and result['real_money'] is False
+    leg=next(r for r in result['activity'] if r['journal_id']==paid['payment_journal'])
+    assert leg['amount']==-4000 and leg['invoice_id']==invoice['id']
+    assert not result['has_more']
+    with pytest.raises(PaymentError,match='account_not_found'):customer_activity(engine,pb,a)
+    with pytest.raises(PaymentError,match='customer_identity_required'):customer_activity(engine,alice,a)
+    engine.refund_invoice(merchant,invoice['id'],'v12-refund-activity-001')
+    assert any(r['amount']==4000 for r in customer_activity(engine,pa,a)['activity'])
+
+
+def test_v12_resolution_no_false_success_or_wrong_payer(engine):
+    from spyderpay_core.postgres.customer_receipt import resolve_payment
+    a,b,m=create(engine);pa=identity_for(engine);pb=identity_for(engine,owner='bob',sub='external-bob')
+    inv=engine.create_invoice(merchant,m,4000,'v12-resolution-invoice-001')
+    iid=inv['id']
+    assert resolve_payment(engine,pa,iid,a,m,4000)['state']=='unresolved'
+    with pytest.raises(PaymentError,match='receipt_not_found'):resolve_payment(engine,pa,iid,a,m,4001)
+    with pytest.raises(PaymentError,match='account_not_found'):resolve_payment(engine,pb,iid,a,m,4000)
+    paid=engine.pay_invoice(alice,iid,a,'v12-resolution-pay-001')
+    r=resolve_payment(engine,pa,iid,a,m,4000)
+    assert r['state']=='committed' and r['receipt']['payment_journal']==paid['payment_journal']
+    assert resolve_payment(engine,pb,iid,b,m,4000)['receipt'] is None
+    engine.refund_invoice(merchant,iid,'v12-resolution-refund-001')
+    assert resolve_payment(engine,pa,iid,a,m,4000)['receipt']['refunded_total']==4000
+
+
+def test_v12_transfer_resolution_and_cancel_tombstone(engine):
+    from spyderpay_core.postgres.customer_transfer import resolve_transfer
+    a,b,_=create(engine);pa=identity_for(engine);pb=identity_for(engine,owner='bob',sub='external-bob')
+    key='wallet-transfer-'+str(uuid.uuid4())
+    assert resolve_transfer(engine,pa,a,b,1200,key)['state']=='unresolved'
+    with pytest.raises(PaymentError,match='account_not_found'):resolve_transfer(engine,pb,a,b,1200,key)
+    assert resolve_transfer(engine,pa,a,b,1200,key,cancel=True)['state']=='cancelled'
+    with pytest.raises(PaymentError,match='transfer_cancelled'):engine.transfer(alice,a,b,1200,key)
+    with pytest.raises(PaymentError,match='idempotency_conflict'):resolve_transfer(engine,pa,a,b,1201,key)
+    assert engine.account(alice,a)['balance']==100000
+    other='wallet-transfer-'+str(uuid.uuid4())
+    posted=engine.transfer(alice,a,b,1200,other)
+    r=resolve_transfer(engine,pa,a,b,1200,other,cancel=True)
+    assert r['state']=='committed' and r['journal_id']==posted['journal_id']
+    assert engine.account(alice,a)['balance']==98800 and engine.reconcile(ops)['ok']
+
+
+def test_v12_expired_invoice_resolution_seals_pending(engine):
+    from spyderpay_core.postgres.customer_receipt import resolve_payment
+    a,b,m=create(engine);pa=identity_for(engine)
+    with engine._connect() as c:
+        iid=str(c.execute("INSERT INTO sp_invoices(tenant_id,merchant_account,amount,expires_at) VALUES(%s,%s,%s,now()-interval '1 minute') RETURNING id",('tenant-alpha',m,4000)).fetchone()['id'])
+    assert resolve_payment(engine,pa,iid,a,m,4000)['state']=='not_paid_final'
+    with engine._connect() as c:assert c.execute('SELECT state FROM sp_invoices WHERE id=%s',(iid,)).fetchone()['state']=='cancelled'
+    with pytest.raises(PaymentError,match='invoice_not_pending'):engine.pay_invoice(alice,iid,a,'v12-expired-pay-attempt')
+    assert engine.account(alice,a)['balance']==100000
+
+
+def test_v12_transfer_cancel_race_no_false_cancel(engine):
+    from spyderpay_core.postgres.customer_transfer import resolve_transfer
+    a,b,_=create(engine);pa=identity_for(engine);key='wallet-transfer-'+str(uuid.uuid4());barrier=threading.Barrier(2)
+    def pay():
+        barrier.wait(timeout=5)
+        try:return engine.transfer(alice,a,b,1200,key)
+        except PaymentError as ex:
+            assert ex.code=='transfer_cancelled';return None
+    def cancel():
+        barrier.wait(timeout=5);return resolve_transfer(engine,pa,a,b,1200,key,cancel=True)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f1=pool.submit(pay);f2=pool.submit(cancel);posted=f1.result(timeout=10);r=f2.result(timeout=10)
+    if posted is None:
+        assert r['state']=='cancelled' and engine.account(alice,a)['balance']==100000
+    else:
+        assert r['state']=='committed' and r['journal_id']==posted['journal_id'] and engine.account(alice,a)['balance']==98800
+    assert engine.reconcile(ops)['ok']

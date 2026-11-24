@@ -18,3 +18,38 @@ def customer_receipt(processor,p,invoice_id):
         result=_jsonable(row)
         result['refunded_total']=row['amount'] if row['state']=='refunded' else totals(conn,str(row['id']))[0]
         return {**result,'currency':'UZS','real_money':False}
+
+
+def resolve_payment(processor,p,invoice_id,payer_account,expected_merchant,expected_amount):
+    """A lost response is not permission to reissue a payment. Lock invoice before
+    classifying. Final no-debit requires immutable terms and terminal/expired state.
+    No counterparty data or receipt of another payer is returned.
+    """
+    from .store import _amount
+    if p.identity is None or p.roles != frozenset({'customer'}):
+        raise PaymentError('customer_identity_required',403)
+    iid,payer,merchant,amount=_id(invoice_id),_id(payer_account),_id(expected_merchant),_amount(expected_amount)
+    with processor._connect() as conn,conn.transaction():
+        assert_membership(conn,p)
+        account=conn.execute("SELECT id FROM sp_accounts WHERE id=%s AND tenant_id=%s AND owner_id=%s AND kind='customer'",(payer,p.tenant_id,p.subject)).fetchone()
+        if not account:raise PaymentError('account_not_found',404)
+        row=conn.execute('''SELECT id,state,amount,merchant_account,payer_account,payment_journal,expires_at
+            FROM sp_invoices WHERE id=%s AND tenant_id=%s AND merchant_account=%s AND amount=%s FOR UPDATE''',(iid,p.tenant_id,merchant,amount)).fetchone()
+        if not row:raise PaymentError('receipt_not_found',404)
+        base={'invoice_id':iid,'payer_account':payer,'merchant_account':merchant,'amount':amount,'currency':'UZS','real_money':False}
+        if row['state'] in ('paid','refunded') and str(row['payer_account'])==payer and row['payment_journal']:
+            receipt=_jsonable({k:row[k] for k in ('id','state','amount','merchant_account','payer_account','payment_journal')})
+            receipt['refunded_total']=amount if row['state']=='refunded' else totals(conn,iid)[0]
+            return {**base,'state':'committed','receipt':{**receipt,'currency':'UZS','real_money':False}}
+        expired=conn.execute('SELECT %s::timestamptz<=clock_timestamp() AS expired',(row['expires_at'],)).fetchone()['expired']
+        # Seal an expired pending invoice into its immutable terminal state before
+        # asserting no debit. This also handles clock skew/backward clock adjustments:
+        # a delayed POST cannot reopen a cancelled invoice. No ledger write is made.
+        if row['state']=='pending' and expired:
+            changed=conn.execute("UPDATE sp_invoices SET state='cancelled' WHERE id=%s AND state='pending' RETURNING id",(iid,)).fetchone()
+            if not changed:raise PaymentError('resolution_conflict',409)
+            processor._audit(conn,p,'expired_invoice_resolution',iid,{'invoice_id':iid})
+            return {**base,'state':'not_paid_final','receipt':None}
+        if row['state']=='cancelled' or (expired and row['state'] in ('paid','refunded') and str(row['payer_account'])!=payer):
+            return {**base,'state':'not_paid_final','receipt':None}
+        return {**base,'state':'unresolved','receipt':None}

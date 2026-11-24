@@ -62,6 +62,19 @@ class AmountRefund(_Base):
     amount: StrictInt = Field(gt=0)
 
 
+class TransferResolution(_Base):
+    source: str = Field(min_length=36,max_length=36)
+    target: str = Field(min_length=36,max_length=36)
+    amount: StrictInt = Field(gt=0)
+    idempotency: str = Field(min_length=52,max_length=52)
+
+
+class PaymentResolution(_Base):
+    payer_account: str = Field(min_length=36,max_length=36)
+    expected_merchant: str = Field(min_length=36,max_length=36)
+    expected_amount: StrictInt = Field(gt=0)
+
+
 class PosPreview(_Base):
     token: str = Field(min_length=1,max_length=2048)
 
@@ -255,11 +268,16 @@ def create_app(processor: PgProcessor, service_config: str, oidc_config: str, *,
         if p.identity is None:raise PaymentError('user_identity_required',403)
         with processor._connect() as conn, conn.transaction():
             assert_membership(conn,p)
-            rows=conn.execute('''SELECT id,kind,currency,status,balance FROM sp_accounts WHERE tenant_id=%s AND owner_id=%s AND kind=%s ORDER BY created_at,id LIMIT 100''',(p.tenant_id,p.subject,next(iter(p.roles)))).fetchall()
-            return {'accounts':[_jsonable(x) for x in rows]}
+            rows=conn.execute('''SELECT id,kind,currency,status,balance FROM sp_accounts WHERE tenant_id=%s AND owner_id=%s AND kind=%s ORDER BY created_at,id LIMIT 101''',(p.tenant_id,p.subject,next(iter(p.roles)))).fetchall()
+            return {'accounts':[_jsonable(x) for x in rows[:100]],'has_more':len(rows)>100,'role':next(iter(p.roles)),'currency':'UZS','sandbox':True,'real_money':False}
 
     @app.get('/v3/accounts/{account_id}')
     def account(request: Request,account_id: str):return processor.account(actor(request),account_id)
+
+    @app.get('/v3/accounts/{account_id}/activity')
+    def activity(request: Request,account_id: str):
+        from .customer_activity import customer_activity
+        return customer_activity(processor,user(request,'customer'),account_id)
 
     @app.post('/v3/ops/accounts')
     def create_account(request: Request,data: AccountCreate,idempotency_key: Idem):
@@ -298,6 +316,16 @@ def create_app(processor: PgProcessor, service_config: str, oidc_config: str, *,
     def transfer(request: Request,data: Transfer,idempotency_key: Idem):
         return processor.transfer(user(request,'customer'),data.source,data.target,data.amount,idempotency_key)
 
+    @app.post('/v3/transfers/resolution')
+    def transfer_resolution(request: Request,data: TransferResolution):
+        from .customer_transfer import resolve_transfer
+        return resolve_transfer(processor,user(request,'customer'),data.source,data.target,data.amount,data.idempotency)
+
+    @app.post('/v3/transfers/cancel')
+    def transfer_cancel(request: Request,data: TransferResolution):
+        from .customer_transfer import resolve_transfer
+        return resolve_transfer(processor,user(request,'customer'),data.source,data.target,data.amount,data.idempotency,cancel=True)
+
     @app.post('/v3/invoices')
     def create_invoice(request: Request,data: InvoiceCreate,idempotency_key: Idem):
         return processor.create_invoice(user(request,'merchant'),data.merchant_account,data.amount,idempotency_key,data.ttl_minutes)
@@ -318,6 +346,11 @@ def create_app(processor: PgProcessor, service_config: str, oidc_config: str, *,
     def receipt(request: Request,invoice_id: str):
         from .customer_receipt import customer_receipt
         return customer_receipt(processor,user(request,'customer'),invoice_id)
+
+    @app.post('/v3/invoices/{invoice_id}/resolution')
+    def resolution(request: Request,invoice_id: str,data: PaymentResolution):
+        from .customer_receipt import resolve_payment
+        return resolve_payment(processor,user(request,'customer'),invoice_id,data.payer_account,data.expected_merchant,data.expected_amount)
 
     @app.post('/v3/invoices/{invoice_id}/pay')
     def pay(request: Request,invoice_id: str,data: Pay,idempotency_key: Idem):

@@ -97,6 +97,8 @@ class PgProcessor:
                 if row['request_digest'] != fingerprint:
                     raise PaymentError('idempotency_conflict', 409)
                 if row['result'] is not None:
+                    if payload['op']=='transfer' and isinstance(row['result'],dict) and row['result'].get('cancelled') is True:
+                        raise PaymentError('transfer_cancelled',409)
                     return row['result']
                 from .traffic_gate import require_open_for
                 require_open_for(conn,payload['op'])
@@ -276,7 +278,9 @@ class PgProcessor:
             inv=conn.execute('SELECT * FROM sp_invoices WHERE id=%s FOR UPDATE',(iid,)).fetchone()
             if not inv or inv['tenant_id']!=p.tenant_id: raise PaymentError('invoice_not_found',404)
             if inv['state']!='pending': raise PaymentError('invoice_not_pending',409)
-            if inv['expires_at']<=datetime.now(timezone.utc): raise PaymentError('invoice_expired',409)
+            # Same database clock and locked invoice as the recovery endpoint.
+            if conn.execute('SELECT %s::timestamptz<=clock_timestamp() AS expired',(inv['expires_at'],)).fetchone()['expired']:
+                raise PaymentError('invoice_expired',409)
             src,dst=self._lock_accounts(conn,payer,str(inv['merchant_account']))
             self._scope(p,src,'customer')
             if dst['kind']!='merchant' or dst['tenant_id']!=p.tenant_id:
