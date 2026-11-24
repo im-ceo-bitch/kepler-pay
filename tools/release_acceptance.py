@@ -26,7 +26,7 @@ def run(label,argv,env):
 def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--disposable-postgres',action='store_true',help='I explicitly confirm a dedicated disposable test database and server');a=p.parse_args()
     env={**os.environ,'SPYDERPAY_ENV':'test'};py=sys.executable
-    results=[run('unit',[py,'-m','pytest','-q','tests','--ignore=tests/postgres'],env),run('protected_release_gates',[py,'-m','unittest','discover','-s','scripts/security_gate','-v'],env),run('merchant_sdk',['node','--test','integrations/merchant-sdk/merchant.test.mjs'],env),run('nginx_mtls',[py,'tools/edge_acceptance.py'],env),run('static_security',[py,'-m','bandit','-q','-r','spyderpay_core'],env),run('dependency_audit',[py,'-m','pip_audit','--local'],env)]
+    results=[run('unit',[py,'-m','pytest','-q','tests','--ignore=tests/postgres'],env),run('protected_release_gates',[py,'-m','unittest','discover','-s','scripts/security_gate','-v'],env),run('merchant_sdk',['node','--test','integrations/merchant-sdk/merchant.test.mjs'],env),run('wallet_swift_sdk',['swift','test','--package-path','integrations/wallet-ios'],env),run('nginx_mtls',[py,'tools/edge_acceptance.py'],env),run('static_security',[py,'-m','bandit','-q','-r','spyderpay_core'],env),run('dependency_audit',[py,'-m','pip_audit','--local'],env)]
     if a.disposable_postgres:
         try:
             from psycopg.conninfo import conninfo_to_dict

@@ -983,3 +983,27 @@ def test_v10_monitor_sees_real_counts_without_operator_privileges(engine):
     with pytest.raises(PaymentError):engine.create_account(m,'new-owner','merchant','monitor-create-0001')
     with engine._connect() as c:c.execute("SELECT sp_gate_pause('monitor-incident-001')")
     assert validate_report(operational_snapshot(engine,m))['severity']=='critical'
+
+
+def test_v11_receipt_only_payer_and_no_unpaid_receipt(engine):
+    from spyderpay_core.postgres.customer_receipt import customer_receipt
+    a,b,m=create(engine)
+    pa=identity_for(engine);pb=identity_for(engine,owner='bob',sub='external-bob')
+    inv=engine.create_invoice(merchant,m,4000,'v11-invoice-receipt-0001')
+    with pytest.raises(PaymentError,match='receipt_not_found'):customer_receipt(engine,pa,inv['id'])
+    paid=engine.pay_invoice(alice,inv['id'],a,'v11-pay-receipt-0001')
+    receipt=customer_receipt(engine,pa,inv['id'])
+    assert receipt['payment_journal']==paid['payment_journal'] and receipt['amount']==4000 and receipt['real_money'] is False
+    with pytest.raises(PaymentError,match='receipt_not_found'):customer_receipt(engine,pb,inv['id'])
+    engine.refund_invoice(merchant,inv['id'],'v11-refund-receipt-0001')
+    assert customer_receipt(engine,pa,inv['id'])['refunded_total']==4000
+
+
+def test_v11_velocity_across_accounts_for_same_owner(engine):
+    a,b,_=create(engine)
+    second=engine.create_account(ops,'alice','customer','v11-second-alice-account')['id']
+    p=identity_for(engine)
+    for i in range(10):engine.transfer(alice,a,b,1,f'v11-owner-velocity-{i:04d}')
+    with engine._connect() as conn,conn.transaction():
+        with pytest.raises(PaymentError,match='bank_velocity_or_amount_limit'):
+            Compliance(engine).enforce(conn,p,second,1)

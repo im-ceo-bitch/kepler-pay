@@ -161,6 +161,10 @@ class Sales:
             if self._row(c,sale)['invoice'] != invoice:
                 raise RuntimeError('invoice_reference_conflict')
 
+    def recent(self):
+        with self.connect() as c:
+            return [dict(r) for r in c.execute('SELECT * FROM sale WHERE origin=? ORDER BY created DESC LIMIT 100',(self.origin,))]
+
     def pending(self):
         with self.connect() as c:
             return [dict(r) for r in c.execute('SELECT * FROM sale WHERE origin=? AND invoice IS NULL ORDER BY created LIMIT 100', (self.origin,))]
@@ -180,6 +184,8 @@ def check_invoice(sale, invoice):
     if type(refunded) is not int or not 0 <= refunded <= sale['amount']:
         raise RuntimeError('invalid_refunded_amount')
     state = invoice['state']
+    if (state == 'refunded' and refunded != sale['amount']) or (state in ('pending','cancelled','expired') and refunded != 0) or (state == 'paid' and refunded == sale['amount']):
+        raise RuntimeError('refund_state_mismatch')
     if state == 'pending' and expiry <= datetime.now(timezone.utc):
         state = 'expired'
     return {'sale_id':sale['id'],'invoice_id':invoice['id'],'amount':sale['amount'],'currency':'UZS','state':state,'refunded_total':refunded,'prelicense':True}
@@ -220,7 +226,7 @@ def main():
         raise SystemExit('Prelicense only')
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest='cmd',required=True)
-    sub.add_parser('accounts'); sub.add_parser('pending'); sub.add_parser('new-reference')
+    sub.add_parser('accounts'); sub.add_parser('pending'); sub.add_parser('recent'); sub.add_parser('new-reference')
     c = sub.add_parser('create'); c.add_argument('sale'); c.add_argument('merchant'); c.add_argument('amount',type=int)
     for name in ('resume','status','qr'):
         sub.add_parser(name).add_argument('sale')
@@ -231,6 +237,7 @@ def main():
     sales = Sales(os.environ['SPYDERPAY_TERMINAL_STATE_DIR'],api.origin); terminal = Terminal(api,sales)
     if a.cmd == 'accounts': result = api.accounts()
     elif a.cmd == 'pending': result = sales.pending()
+    elif a.cmd == 'recent': result = sales.recent()
     elif a.cmd == 'create': result = terminal.create(a.sale,a.merchant,a.amount)
     elif a.cmd == 'resume': result = terminal.resume(a.sale)
     elif a.cmd == 'status': result = terminal.status(a.sale)

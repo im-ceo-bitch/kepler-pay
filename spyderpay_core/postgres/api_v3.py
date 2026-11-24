@@ -119,7 +119,7 @@ class IdentityRateLimit:
             if row['hits']>90:raise PaymentError('rate_limited',429)
 
 
-def create_app(processor: PgProcessor, service_config: str, oidc_config: str, *, allow_sandbox_credit=False, pos_config=None):
+def create_app(processor: PgProcessor, service_config: str, oidc_config: str, *, allow_sandbox_credit=False, pos_config=None, provider_config=None):
     credentials=load_credentials(service_config)
     verifier=OIDCVerifier(oidc_config)
     nonces=PostgresNonceStore(processor)
@@ -314,6 +314,11 @@ def create_app(processor: PgProcessor, service_config: str, oidc_config: str, *,
             if not row:raise PaymentError('invoice_not_found',404)
             return _jsonable(row)
 
+    @app.get('/v3/invoices/{invoice_id}/receipt')
+    def receipt(request: Request,invoice_id: str):
+        from .customer_receipt import customer_receipt
+        return customer_receipt(processor,user(request,'customer'),invoice_id)
+
     @app.post('/v3/invoices/{invoice_id}/pay')
     def pay(request: Request,invoice_id: str,data: Pay,idempotency_key: Idem):
         return processor.pay_invoice(user(request,'customer'),invoice_id,data.payer_account,idempotency_key)
@@ -330,7 +335,7 @@ def create_app(processor: PgProcessor, service_config: str, oidc_config: str, *,
     from .bank_api import mount_bank_routes
     mount_bank_routes(app,processor)
     from .compliance_api import mount_compliance_routes
-    mount_compliance_routes(app,processor)
+    mount_compliance_routes(app,processor,provider_config)
     from .dispatch_api import mount_dispatch_routes
     mount_dispatch_routes(app,processor)
     from .financial_api import mount_financial_routes
@@ -363,7 +368,7 @@ def main():
     from .runtime_preflight import check_runtime
     with processor._connect() as conn:
         check_runtime(conn)
-    app=create_app(processor,os.environ['SPYDERPAY_SERVICE_KEYS_JSON'],os.environ['SPYDERPAY_OIDC_JSON'],allow_sandbox_credit=os.getenv('SPYDERPAY_ALLOW_SANDBOX_CREDIT')=='yes',pos_config=os.getenv('SPYDERPAY_POS_KEYS_JSON'))
+    app=create_app(processor,os.environ['SPYDERPAY_SERVICE_KEYS_JSON'],os.environ['SPYDERPAY_OIDC_JSON'],allow_sandbox_credit=os.getenv('SPYDERPAY_ALLOW_SANDBOX_CREDIT')=='yes',pos_config=os.getenv('SPYDERPAY_POS_KEYS_JSON'),provider_config=os.getenv('SPYDERPAY_COMPLIANCE_PROVIDER_JSON'))
     import logging
     logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(name)s %(message)s')
     import uvicorn

@@ -91,3 +91,14 @@ def test_tls_request_no_retry_or_redirect(tmp_path):
     api=MerchantAPI(ORIGIN,f,None,transport=Connection)
     with pytest.raises(RuntimeError,match='302'):api.create({'id':uid(),'merchant':uid(),'amount':100})
     assert len(calls)==1 and calls[0][1]['headers']['Idempotency-Key'].startswith('pos-sale-')
+
+
+def test_recent_sales_survive_restart(terminal):
+    t,a,s=terminal;one,two=uid(),uid();merchant=uid();t.create(one,merchant,500);t.create(two,merchant,600)
+    restarted=Sales(s.path.parent,ORIGIN);assert {x['id'] for x in restarted.recent()}=={one,two}
+    assert not Sales(s.path.parent,'https://other.example').recent()
+
+@pytest.mark.parametrize('state,refund',[('pending',1),('refunded',499),('paid',500),('cancelled',10)])
+def test_terminal_rejects_inconsistent_refund_status(terminal,state,refund):
+    t,a,s=terminal;sid=uid();t.create(sid,uid(),500);a.invoices[sid]['state']=state;a.refunded=refund
+    with pytest.raises(RuntimeError,match='refund_state_mismatch'):t.status(sid)

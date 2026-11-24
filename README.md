@@ -1,4 +1,4 @@
-# SpyderPay Core 0.10.0 — pre-license / cumulative blocks 1–3
+# SpyderPay Core 0.11.0 — pre-license / cumulative blocks 1–3
 
 Private payment core with immutable double-entry ledger, signed v3 service API,
 OIDC transaction authorization, sandbox banking, compliance review, consent and
@@ -7,7 +7,7 @@ No live money, bank connections, production activation or security certification
 
 ## Installation
 Existing permanent `.github/workflows/spyderpay-unpack.yml` remains unchanged.
-Upload only `spyderpay-core-update-v010.zip` to the repository root. The workflow
+Upload only `spyderpay-core-update-v011.zip` to the repository root. The workflow
 selects the newest cumulative ZIP, installs dependencies and runs required tests
 before applying the archive. Workflows cannot be modified by an update ZIP.
 
@@ -45,3 +45,8 @@ Migration and DB privilege scripts must be run by a separate owner/admin.
 - `docs/RELEASE_V10_RU.md` and `infrastructure/operations/acceptance-v10.md`: current delivery and mandatory acceptance.
 - `python -m tools.release_acceptance`: reports actual results, does not enable production.
 - `python -m spyderpay_core.postgres.ops.merchant_gui`: private POS (external IdP token agent + `.[terminal]` + Tk).
+
+## Finalization v0.11
+- `docs/RELEASE_V11_RU.md`: provider evidence, cross-account risk, receipt, restore drill, mobile SDK.
+- `integrations/wallet-ios/README.md`: Swift Package and reference NFC transport.
+- `python -m spyderpay_core.postgres.ops.restore_drill --help`: isolated restore tool.
