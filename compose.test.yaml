@@ -1,0 +1,20 @@
+# LOCAL TEST DATABASE ONLY — never deploy publicly or with financial data.
+name: spyderpay-local-test
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: spyder_test
+      POSTGRES_PASSWORD: local-test-only-do-not-reuse
+      POSTGRES_DB: spyderpay_test
+    ports:
+      - '127.0.0.1:5436:5432'
+    tmpfs:
+      - /var/lib/postgresql/data:rw,size=1g
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U spyder_test -d spyderpay_test"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+    security_opt:
+      - no-new-privileges:true
