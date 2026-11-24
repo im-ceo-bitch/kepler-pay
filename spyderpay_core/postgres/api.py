@@ -1,4 +1,5 @@
-"""Private S2S payment core API. Sandbox/prelicense environment ONLY.
+"""Legacy v2 API factory retained for local regression tests ONLY.
+CLI launches v3; do not expose this legacy factory.
 
 Needs PostgreSQL and operator-authenticated reverse proxy. Binds loopback by default.
 No public mobile app may hold these HMAC signing keys; customer OIDC gateway is TBD.
@@ -53,6 +54,8 @@ class Credit(_Base):
 
 
 def create_app(processor: PgProcessor, key_config: str):
+    if os.getenv('SPYDERPAY_ENV')!='test':
+        raise RuntimeError('legacy_v2_api_is_test_only')
     keys=load_keys(key_config)
     nonce_store=PostgresNonceStore(processor)
     app=FastAPI(title='SpyderPay Private Payment Core',version='0.2.0',
@@ -145,15 +148,10 @@ def create_app(processor: PgProcessor, key_config: str):
 
 
 def main():
+    # v2 callable retained for old local tests, never a deployed endpoint.
     if os.environ.get('SPYDERPAY_ENV')!='prelicense':
-        raise SystemExit('Refusing to start outside SPYDERPAY_ENV=prelicense')
-    dsn=os.environ.get('SPYDERPAY_PG_DSN')
-    keys=os.environ.get('SPYDERPAY_SERVICE_KEYS_JSON')
-    if not dsn or not keys:
-        raise SystemExit('SPYDERPAY_PG_DSN and SERVICE_KEYS_JSON are required')
-    app=create_app(PgProcessor(dsn),keys)
-    import uvicorn
-    uvicorn.run(app,host='127.0.0.1',port=int(os.getenv('PORT','8766')),log_config=None,access_log=False)
-
+        raise SystemExit('Refusing non-prelicense environment')
+    from .api_v3 import main as run_v3
+    run_v3()
 
 if __name__=='__main__':main()

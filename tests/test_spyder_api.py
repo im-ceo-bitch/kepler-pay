@@ -32,9 +32,13 @@ class APITests(unittest.TestCase):
         self.p=FakeProcessor()
         self.patch=patch('spyderpay_core.postgres.api.PostgresNonceStore',FakeNonceStore)
         self.patch.start()
+        self.env_patch=patch.dict('os.environ',{'SPYDERPAY_ENV':'test'})
+        self.env_patch.start()
         self.client=TestClient(create_app(self.p,cfg))
 
-    def tearDown(self):self.patch.stop()
+    def tearDown(self):
+        self.patch.stop()
+        self.env_patch.stop()
 
     def request(self,path='/v2/transfers',body=None,method='POST',tamper=False,idem='a-test-idempotency-key'):
         if body is None:body={'source':'account-1','target':'account-2','amount':10}

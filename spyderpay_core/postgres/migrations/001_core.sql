@@ -5,6 +5,7 @@ BEGIN;
 SELECT pg_advisory_xact_lock(8421778102);
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 CREATE TABLE IF NOT EXISTS sp_schema_version (version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now());
+DO $$ BEGIN IF EXISTS(SELECT 1 FROM sp_schema_version WHERE version>2) THEN RAISE EXCEPTION 'refusing_to_reapply_legacy_migration'; END IF; END $$;
 CREATE TABLE IF NOT EXISTS sp_accounts (
  id uuid PRIMARY KEY DEFAULT gen_random_uuid(), tenant_id text NOT NULL,
  owner_id text NOT NULL, kind text NOT NULL CHECK(kind IN ('customer','merchant','system')),

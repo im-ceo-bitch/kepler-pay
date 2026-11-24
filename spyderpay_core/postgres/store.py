@@ -56,6 +56,8 @@ class Principal:
     tenant_id: str
     subject: str
     roles: frozenset[str]
+    identity: Any = None
+    approval_id: str | None = None
 
     def require(self, role: str):
         if role not in self.roles:
@@ -85,6 +87,9 @@ class PgProcessor:
         # One transaction contains the idempotency slot, business changes, and outbox.
         with self._connect() as conn:
             with conn.transaction():
+                if principal.identity is not None:
+                    from .identity import assert_membership
+                    assert_membership(conn, principal)
                 conn.execute('''INSERT INTO sp_idempotency(actor,idem_key,request_digest)
                     VALUES (%s,%s,%s) ON CONFLICT DO NOTHING''',(actor,key,fingerprint))
                 row = conn.execute('''SELECT request_digest,result FROM sp_idempotency
@@ -93,6 +98,9 @@ class PgProcessor:
                     raise PaymentError('idempotency_conflict', 409)
                 if row['result'] is not None:
                     return row['result']
+                if principal.identity is not None and payload['op'] in {'transfer','pay_invoice','refund_invoice'}:
+                    from .identity import consume_approval
+                    consume_approval(conn, principal, key, fingerprint)
                 result = func(conn)
                 conn.execute('''UPDATE sp_idempotency SET result=%s::jsonb
                     WHERE actor=%s AND idem_key=%s''',(json.dumps(result),actor,key))
@@ -149,20 +157,24 @@ class PgProcessor:
         return self._once(p,idem,data,run)
 
     def account(self, p: Principal, account_id: str) -> dict:
-        with self._connect() as conn:
+        with self._connect() as conn, conn.transaction():
+            if p.identity is not None:
+                from .identity import assert_membership
+                assert_membership(conn,p)
             row=self._account(conn,account_id)
             if 'ops' not in p.roles:
+                p.require(row['kind'])
                 self._scope(p,row,row['kind'])
             elif row['tenant_id'] != p.tenant_id:
                 raise PaymentError('forbidden',403)
             return _jsonable(row)
 
-    def _post(self, conn, p: Principal, kind: str, src: dict, dst: dict, amount: int, reference: str | None = None) -> str:
+    def _post(self, conn, p: Principal, kind: str, src: dict, dst: dict, amount: int, reference: str | None = None, *, allow_frozen_credit: bool = False) -> str:
         if src['tenant_id']!=p.tenant_id or dst['tenant_id']!=p.tenant_id:
             raise PaymentError('forbidden',403)
         if src['currency'] != dst['currency'] or src['currency']!='UZS':
             raise PaymentError('currency_mismatch',422)
-        if src['status']!='active' or dst['status']!='active':
+        if src['status']!='active' or (dst['status']!='active' and not (allow_frozen_credit and kind=='bank_release' and dst['status']=='frozen')):
             raise PaymentError('frozen_or_closed_account',409)
         if src['kind']!='system' and src['balance']<amount:
             raise PaymentError('insufficient_funds',409)
@@ -171,7 +183,7 @@ class PgProcessor:
             row=conn.execute('''SELECT COALESCE(-SUM(p.signed_amount),0) AS total
                 FROM sp_postings p JOIN sp_journals j ON j.id=p.journal_id
                 WHERE p.account_id=%s AND p.signed_amount<0 AND j.created_at >= %s
-                AND j.kind IN ('transfer','merchant_payment')''',(src['id'],cutoff)).fetchone()
+                AND j.kind IN ('transfer','merchant_payment','bank_reserve')''',(src['id'],cutoff)).fetchone()
             if int(row['total'])+amount>MAX_DAILY_OUTGOING:
                 raise PaymentError('daily_limit_exceeded',409)
         journal=conn.execute('''INSERT INTO sp_journals(tenant_id,kind,reference,actor,currency)
@@ -190,6 +202,7 @@ class PgProcessor:
             WHERE id=%s RETURNING balance''',(amount,dst['id'])).fetchone()
         if not cre:
             raise PaymentError('account_not_found',404)
+        conn.execute('UPDATE sp_journals SET sealed=true WHERE id=%s',(jid,))
         self._audit(conn,p,kind,jid,{'src':str(src['id']),'dst':str(dst['id']),'amount':amount})
         self._outbox(conn,p,'ledger.journal.created',jid,{'journal_id':jid,'type':kind,'currency':'UZS'})
         return jid
@@ -228,7 +241,10 @@ class PgProcessor:
 
     def invoice(self,p: Principal,invoice_id: str) -> dict:
         iid=_id(invoice_id)
-        with self._connect() as conn:
+        with self._connect() as conn, conn.transaction():
+            if p.identity is not None:
+                from .identity import assert_membership
+                assert_membership(conn,p)
             inv=conn.execute('SELECT * FROM sp_invoices WHERE id=%s',(iid,)).fetchone()
             if not inv or inv['tenant_id'] != p.tenant_id: raise PaymentError('invoice_not_found',404)
             # Customer may obtain invoice details only with invoice capability (future public signed token).

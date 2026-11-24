@@ -39,9 +39,9 @@ def load_keys(raw: str) -> dict[str,ServiceKey]:
         kid=item['key_id']; encoded=item['secret_b64']
         if not KEY_ID.fullmatch(kid) or kid in out:raise ValueError('invalid or duplicate key id')
         secret=base64.b64decode(encoded,validate=True)
-        if len(secret)<32:raise ValueError('service key must have >=256 bits entropy')
+        if len(secret)<32 or len(secret)>128:raise ValueError('service key length must be 32..128 bytes')
         roles=item['roles']; tenant=item['tenant_id']; subject=item['subject']
-        if not isinstance(roles,list) or not roles or not set(roles)<={'ops','customer','merchant'}:
+        if not isinstance(roles,list) or not roles or not set(roles)<={'ops','customer','merchant','bank_ops','bank_review','bank_callback','bank_statement','risk_ops'}:
             raise ValueError('invalid service roles')
         from .store import _identity
         out[kid]=ServiceKey(secret,Principal(kid,_identity(tenant),_identity(subject),frozenset(roles)))
