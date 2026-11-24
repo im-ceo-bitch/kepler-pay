@@ -1,0 +1,339 @@
+name: SpyderPay Core - Secure ZIP Update
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'spyderpay-core-update-*.zip'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: spyderpay-core-updates
+  cancel-in-progress: false
+jobs:
+  verify:
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: spyder_test
+          POSTGRES_PASSWORD: test-only-password
+          POSTGRES_DB: spyderpay_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U spyder_test -d spyderpay_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 15
+    env:
+      SPYDERPAY_TEST_PG_DSN: postgresql://spyder_test:test-only-password@127.0.0.1:5432/spyderpay_test
+      SPYDERPAY_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Verify and unpack archive in isolated runner
+        run: |
+          python - --repo . --pattern 'spyderpay-core-update-*.zip' --allow spyderpay_core --allow tests --allow docs --allow integrations <<'PYTHON_INSTALLER'
+          #!/usr/bin/env python3
+          """Fail-closed ZIP overlay installer for GitHub Actions.
+
+          Only allowlisted source trees may be updated; workflow files, Git metadata,
+          credentials and repository root settings must be installed via reviewed commits.
+          The install is staged and checks every archive entry before modifying files.
+          """
+          from __future__ import annotations
+
+          import argparse
+          import hashlib
+          import os
+          import shutil
+          import stat
+          import sys
+          import tempfile
+          import zipfile
+          from pathlib import Path, PurePosixPath
+
+          DENIED_NAMES = {'.git', '.github', '__MACOSX', '.DS_Store', 'Thumbs.db', '.env', '.secrets', 'node_modules', '__pycache__'}
+          DENIED_SUFFIXES = ('.p8','.p12','.pem','.key','.mobileprovision','.sqlite','.sqlite3','.db','.pyc')
+          BOOTSTRAP_SHA256 = '4d53ef8167c4750d27efdc63800051bb6c665ea1c3c7c98fb44c2f1f092c110d'
+          BOOTSTRAP_FILES = frozenset({'.env.example', '.gitignore', 'Makefile', 'README.md', 'compose.test.yaml', 'pyproject.toml', 'scripts/cleanup_generated.py', 'scripts/secure_unpack.py', 'scripts/security_gate/test_release_contract.py', 'tools/migrate_postgres.py', 'tools/sign_request.py'})
+          MAX_MEMBERS = 700
+          MAX_BYTES = 36 * 1024 * 1024
+          MAX_ONE_FILE = 9 * 1024 * 1024
+
+
+          def _safe_path(name: str, allowed: tuple[str,...], bootstrap: bool = False) -> str | None:
+              if not name or '\\' in name or '\x00' in name or name.startswith('/') or name.startswith('~'):
+                  raise ValueError('unsafe_zip_path')
+              p = PurePosixPath(name)
+              if any(part in ('', '..', '.') for part in name.split('/')):
+                  raise ValueError('unsafe_zip_path')
+              if p.parts[0].endswith(':') or any(part in DENIED_NAMES for part in p.parts) or name.lower().endswith(DENIED_SUFFIXES):
+                  raise ValueError('prohibited_file')
+              if bootstrap and name in BOOTSTRAP_FILES:
+                  return name
+              if not any(name.startswith(prefix + '/') and len(name) > len(prefix)+1 for prefix in allowed):
+                  raise ValueError('outside_allowlist')
+              return str(p)
+
+
+          def install(repo: Path, archive: Path, allowed: tuple[str,...]) -> int:
+              repo = repo.resolve()
+              if archive.is_symlink() or not archive.is_file():
+                  raise ValueError('archive_not_regular')
+              archive = archive.resolve()
+              if archive.parent != repo:
+                  raise ValueError('archive_must_be_in_repo_root')
+              if archive.stat().st_size > MAX_BYTES:
+                  raise ValueError('archive_too_large')
+              bootstrap = archive.name == 'spyderpay-core-update-v002-full.zip' and hashlib.sha256(archive.read_bytes()).hexdigest() == BOOTSTRAP_SHA256
+              if archive.name.endswith('-full.zip') and not bootstrap:
+                  raise ValueError('unverified_bootstrap_archive')
+              staged = []
+              with zipfile.ZipFile(archive) as z:
+                  infos = [x for x in z.infolist() if not x.is_dir()]
+                  if not infos or len(infos) > MAX_MEMBERS:
+                      raise ValueError('invalid_archive_member_count')
+                  if sum(x.file_size for x in infos) > MAX_BYTES:
+                      raise ValueError('archive_uncompressed_too_large')
+                  seen = set()
+                  for item in infos:
+                      dest = _safe_path(item.filename, allowed, bootstrap)
+                      if item.file_size > MAX_ONE_FILE or item.compress_size == 0 and item.file_size != 0:
+                          raise ValueError('zip_bomb_or_large_file')
+                      if stat.S_IFMT(item.external_attr >> 16) not in (0, stat.S_IFREG):
+                          raise ValueError('symlinks_not_allowed')
+                      if dest in seen:
+                          raise ValueError('duplicate_zip_entry')
+                      seen.add(dest)
+                      target = repo / dest
+                      # Existing symlinks in repo could otherwise escape the root on overwrite.
+                      for parent in (target, *target.parents):
+                          if parent == repo:
+                              break
+                          if parent.is_symlink():
+                              raise ValueError('destination_symlink')
+                      if not target.resolve().is_relative_to(repo):
+                          raise ValueError('destination_outside_repository')
+                      staged.append((item,target))
+                  with tempfile.TemporaryDirectory(prefix='spyderpay-install-') as tmp:
+                      tmp_path=Path(tmp)
+                      for item,target in staged:
+                          rel=target.relative_to(repo)
+                          destination=tmp_path / rel
+                          destination.parent.mkdir(parents=True,exist_ok=True)
+                          with z.open(item) as src, destination.open('wb') as dst:
+                              shutil.copyfileobj(src,dst)
+                      # Stage successful; install source files. Clean files are never deleted.
+                      for _, target in staged:
+                          rel=target.relative_to(repo)
+                          target.parent.mkdir(parents=True,exist_ok=True)
+                          shutil.copyfile(tmp_path/rel,target)
+              archive.unlink()  # Delete only successfully processed update ZIP.
+              return len(staged)
+
+
+          def main():
+              parser=argparse.ArgumentParser()
+              parser.add_argument('--repo', default='.')
+              parser.add_argument('--pattern',required=True)
+              parser.add_argument('--allow',action='append',required=True)
+              args=parser.parse_args()
+              repo=Path(args.repo).resolve()
+              matches=sorted(repo.glob(args.pattern))
+              if not matches:
+                  raise SystemExit('No matching update ZIP')
+              if len(matches)!=1:
+                  raise SystemExit('Exactly one update ZIP per push is required')
+              count=install(repo,matches[0],tuple(args.allow))
+              print(f'Installed {count} allowlisted files and removed {matches[0].name}')
+
+
+          if __name__=='__main__':
+              try:
+                  main()
+              except (OSError,zipfile.BadZipFile,ValueError) as exc:
+                  print(f'Safe ZIP unpack refused: {exc}',file=sys.stderr)
+                  raise SystemExit(2)
+          PYTHON_INSTALLER
+      - name: Test payment core without write token
+        run: |
+          python -m pip install -e '.[dev]'
+          python -m compileall -q spyderpay_core
+          python -m pytest -q tests --ignore=tests/postgres
+          python -m pytest -q tests/postgres
+          python -m unittest discover -s scripts/security_gate -v
+          python -m bandit -q -r spyderpay_core
+  apply:
+    needs: verify
+    if: needs.verify.result == 'success' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Check main has not changed since verification
+        run: |
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$GITHUB_SHA"
+      - name: Apply same archive without executing its code
+        run: |
+          python - --repo . --pattern 'spyderpay-core-update-*.zip' --allow spyderpay_core --allow tests --allow docs --allow integrations <<'PYTHON_INSTALLER'
+          #!/usr/bin/env python3
+          """Fail-closed ZIP overlay installer for GitHub Actions.
+
+          Only allowlisted source trees may be updated; workflow files, Git metadata,
+          credentials and repository root settings must be installed via reviewed commits.
+          The install is staged and checks every archive entry before modifying files.
+          """
+          from __future__ import annotations
+
+          import argparse
+          import hashlib
+          import os
+          import shutil
+          import stat
+          import sys
+          import tempfile
+          import zipfile
+          from pathlib import Path, PurePosixPath
+
+          DENIED_NAMES = {'.git', '.github', '__MACOSX', '.DS_Store', 'Thumbs.db', '.env', '.secrets', 'node_modules', '__pycache__'}
+          DENIED_SUFFIXES = ('.p8','.p12','.pem','.key','.mobileprovision','.sqlite','.sqlite3','.db','.pyc')
+          BOOTSTRAP_SHA256 = '4d53ef8167c4750d27efdc63800051bb6c665ea1c3c7c98fb44c2f1f092c110d'
+          BOOTSTRAP_FILES = frozenset({'.env.example', '.gitignore', 'Makefile', 'README.md', 'compose.test.yaml', 'pyproject.toml', 'scripts/cleanup_generated.py', 'scripts/secure_unpack.py', 'scripts/security_gate/test_release_contract.py', 'tools/migrate_postgres.py', 'tools/sign_request.py'})
+          MAX_MEMBERS = 700
+          MAX_BYTES = 36 * 1024 * 1024
+          MAX_ONE_FILE = 9 * 1024 * 1024
+
+
+          def _safe_path(name: str, allowed: tuple[str,...], bootstrap: bool = False) -> str | None:
+              if not name or '\\' in name or '\x00' in name or name.startswith('/') or name.startswith('~'):
+                  raise ValueError('unsafe_zip_path')
+              p = PurePosixPath(name)
+              if any(part in ('', '..', '.') for part in name.split('/')):
+                  raise ValueError('unsafe_zip_path')
+              if p.parts[0].endswith(':') or any(part in DENIED_NAMES for part in p.parts) or name.lower().endswith(DENIED_SUFFIXES):
+                  raise ValueError('prohibited_file')
+              if bootstrap and name in BOOTSTRAP_FILES:
+                  return name
+              if not any(name.startswith(prefix + '/') and len(name) > len(prefix)+1 for prefix in allowed):
+                  raise ValueError('outside_allowlist')
+              return str(p)
+
+
+          def install(repo: Path, archive: Path, allowed: tuple[str,...]) -> int:
+              repo = repo.resolve()
+              if archive.is_symlink() or not archive.is_file():
+                  raise ValueError('archive_not_regular')
+              archive = archive.resolve()
+              if archive.parent != repo:
+                  raise ValueError('archive_must_be_in_repo_root')
+              if archive.stat().st_size > MAX_BYTES:
+                  raise ValueError('archive_too_large')
+              bootstrap = archive.name == 'spyderpay-core-update-v002-full.zip' and hashlib.sha256(archive.read_bytes()).hexdigest() == BOOTSTRAP_SHA256
+              if archive.name.endswith('-full.zip') and not bootstrap:
+                  raise ValueError('unverified_bootstrap_archive')
+              staged = []
+              with zipfile.ZipFile(archive) as z:
+                  infos = [x for x in z.infolist() if not x.is_dir()]
+                  if not infos or len(infos) > MAX_MEMBERS:
+                      raise ValueError('invalid_archive_member_count')
+                  if sum(x.file_size for x in infos) > MAX_BYTES:
+                      raise ValueError('archive_uncompressed_too_large')
+                  seen = set()
+                  for item in infos:
+                      dest = _safe_path(item.filename, allowed, bootstrap)
+                      if item.file_size > MAX_ONE_FILE or item.compress_size == 0 and item.file_size != 0:
+                          raise ValueError('zip_bomb_or_large_file')
+                      if stat.S_IFMT(item.external_attr >> 16) not in (0, stat.S_IFREG):
+                          raise ValueError('symlinks_not_allowed')
+                      if dest in seen:
+                          raise ValueError('duplicate_zip_entry')
+                      seen.add(dest)
+                      target = repo / dest
+                      # Existing symlinks in repo could otherwise escape the root on overwrite.
+                      for parent in (target, *target.parents):
+                          if parent == repo:
+                              break
+                          if parent.is_symlink():
+                              raise ValueError('destination_symlink')
+                      if not target.resolve().is_relative_to(repo):
+                          raise ValueError('destination_outside_repository')
+                      staged.append((item,target))
+                  with tempfile.TemporaryDirectory(prefix='spyderpay-install-') as tmp:
+                      tmp_path=Path(tmp)
+                      for item,target in staged:
+                          rel=target.relative_to(repo)
+                          destination=tmp_path / rel
+                          destination.parent.mkdir(parents=True,exist_ok=True)
+                          with z.open(item) as src, destination.open('wb') as dst:
+                              shutil.copyfileobj(src,dst)
+                      # Stage successful; install source files. Clean files are never deleted.
+                      for _, target in staged:
+                          rel=target.relative_to(repo)
+                          target.parent.mkdir(parents=True,exist_ok=True)
+                          shutil.copyfile(tmp_path/rel,target)
+              archive.unlink()  # Delete only successfully processed update ZIP.
+              return len(staged)
+
+
+          def main():
+              parser=argparse.ArgumentParser()
+              parser.add_argument('--repo', default='.')
+              parser.add_argument('--pattern',required=True)
+              parser.add_argument('--allow',action='append',required=True)
+              args=parser.parse_args()
+              repo=Path(args.repo).resolve()
+              matches=sorted(repo.glob(args.pattern))
+              if not matches:
+                  raise SystemExit('No matching update ZIP')
+              if len(matches)!=1:
+                  raise SystemExit('Exactly one update ZIP per push is required')
+              count=install(repo,matches[0],tuple(args.allow))
+              print(f'Installed {count} allowlisted files and removed {matches[0].name}')
+
+
+          if __name__=='__main__':
+              try:
+                  main()
+              except (OSError,zipfile.BadZipFile,ValueError) as exc:
+                  print(f'Safe ZIP unpack refused: {exc}',file=sys.stderr)
+                  raise SystemExit(2)
+          PYTHON_INSTALLER
+          python - <<'PYTHON_CLEANUP'
+          import subprocess
+          from pathlib import Path
+          root = Path.cwd()
+          for name in subprocess.check_output(['git','ls-files','-z']).decode('utf-8').split('\0'):
+              if not name:
+                  continue
+              p = Path(name)
+              if p.name in {'.DS_Store','Thumbs.db'} or p.suffix == '.pyc' or any(x in {'__MACOSX','__pycache__','.pytest_cache','.mypy_cache','.ruff_cache'} for x in p.parts[:-1]):
+                  if not any(q.is_symlink() for q in (root/p).parents if q != root) and ((root/p).is_file() or (root/p).is_symlink()):
+                      (root/p).unlink()
+          PYTHON_CLEANUP
+      - name: Commit and push verified files
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m 'chore(spyderpay): apply verified ZIP update'
+            git push origin HEAD:main
+          fi
