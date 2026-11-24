@@ -98,7 +98,9 @@ class PgProcessor:
                     raise PaymentError('idempotency_conflict', 409)
                 if row['result'] is not None:
                     return row['result']
-                if principal.identity is not None and payload['op'] in {'transfer','pay_invoice','refund_invoice'}:
+                from .traffic_gate import require_open_for
+                require_open_for(conn,payload['op'])
+                if principal.identity is not None and payload['op'] in {'transfer','pay_invoice','refund_invoice','refund_amount'}:
                     from .identity import consume_approval
                     consume_approval(conn, principal, key, fingerprint)
                 result = func(conn)
@@ -178,6 +180,12 @@ class PgProcessor:
             raise PaymentError('frozen_or_closed_account',409)
         if src['kind']!='system' and src['balance']<amount:
             raise PaymentError('insufficient_funds',409)
+        # Public authenticated payment path, under the existing account locks.
+        if p.identity is not None and kind in ('transfer','merchant_payment','merchant_refund'):
+            from .compliance import Compliance
+            gate=Compliance(self)
+            gate.enforce(conn,p,str(src['id']),amount)
+            gate.enforce(conn,p,str(dst['id']),amount,receive_only=True)
         if src['kind']!='system':
             cutoff=datetime.now(timezone.utc)-timedelta(hours=24)
             row=conn.execute('''SELECT COALESCE(-SUM(p.signed_amount),0) AS total
@@ -226,14 +234,17 @@ class PgProcessor:
             raise PaymentError('invalid_expiry',422)
         data={'op':'create_invoice','merchant_account':merchant_account,'amount':amount,'ttl_minutes':ttl_minutes}
         def run(conn):
-            merchant=self._account(conn,merchant_account)
+            merchant=conn.execute('SELECT * FROM sp_accounts WHERE id=%s FOR UPDATE',(merchant_account,)).fetchone()
+            if not merchant:raise PaymentError('account_not_found',404)
             self._scope(p,merchant,'merchant')
             if merchant['status']!='active': raise PaymentError('frozen_or_closed_account',409)
             expires=datetime.now(timezone.utc)+timedelta(minutes=ttl_minutes)
             r=conn.execute('''INSERT INTO sp_invoices(tenant_id,merchant_account,amount,expires_at)
                 VALUES(%s,%s,%s,%s) RETURNING id,state,amount,expires_at,merchant_account''',
                 (p.tenant_id,merchant_account,amount,expires)).fetchone()
+            from .financial_controls import quote_fee
             result=_jsonable(r)
+            result['merchant_fee']=quote_fee(conn,p,r)
             self._audit(conn,p,'invoice_created',result['id'],data)
             self._outbox(conn,p,'invoice.created',result['id'],result)
             return result
@@ -253,7 +264,10 @@ class PgProcessor:
                 self._scope(p,merchant,'merchant')
             elif 'ops' not in p.roles:
                 raise PaymentError('forbidden',403)
-            return _jsonable(inv)
+            result=_jsonable(inv)
+            from .refunds import totals
+            result['refunded_total']=inv['amount'] if inv['state']=='refunded' else totals(conn,iid)[0]
+            return result
 
     def pay_invoice(self,p: Principal,invoice_id: str,payer: str,idem: str) -> dict:
         p.require('customer');iid=_id(invoice_id);payer=_id(payer)
@@ -268,6 +282,8 @@ class PgProcessor:
             if dst['kind']!='merchant' or dst['tenant_id']!=p.tenant_id:
                 raise PaymentError('forbidden',403)
             jid=self._post(conn,p,'merchant_payment',src,dst,inv['amount'],iid)
+            from .financial_controls import fee_movement
+            fee_movement(self,conn,p,inv,'collect')
             r=conn.execute('''UPDATE sp_invoices SET state='paid',payer_account=%s,payment_journal=%s
                 WHERE id=%s RETURNING id,state,amount,merchant_account,payer_account,payment_journal''',
                 (payer,jid,iid)).fetchone()
@@ -285,6 +301,12 @@ class PgProcessor:
             if inv['state']!='paid': raise PaymentError('invoice_not_paid',409)
             src,dst=self._lock_accounts(conn,str(inv['merchant_account']),str(inv['payer_account']))
             self._scope(p,src,'merchant')
+            from .financial_controls import fee_movement,refund_guard
+            refund_guard(conn,iid)
+            from .refunds import totals
+            if totals(conn,iid)[0]:raise PaymentError('use_amount_refund_for_remaining',409)
+            fee_movement(self,conn,p,inv,'reverse')
+            src=self._account(conn,str(src['id']))
             jid=self._post(conn,p,'merchant_refund',src,dst,inv['amount'],iid)
             r=conn.execute('''UPDATE sp_invoices SET state='refunded',refund_journal=%s WHERE id=%s
                 RETURNING id,state,amount,refund_journal''',(jid,iid)).fetchone()

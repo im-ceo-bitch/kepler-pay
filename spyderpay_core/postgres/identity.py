@@ -145,10 +145,17 @@ def _approval_payload(conn, processor, p: Principal, operation: str, values: dic
         processor._scope(p,processor._account(conn,payer),'customer')
         if inv['state']!='pending':raise PaymentError('invoice_not_pending',409)
         payload={'op':operation,'invoice_id':iid,'payer':payer}
-    elif operation=='refund_invoice':
+    elif operation in ('refund_invoice','refund_amount'):
         p.require('merchant')
         processor._scope(p,processor._account(conn,str(inv['merchant_account'])),'merchant')
         if inv['state']!='paid':raise PaymentError('invoice_not_paid',409)
+        from .refunds import totals,refund_quote
+        previous,_=totals(conn,iid)
+        if operation=='refund_amount':
+            amount=_amount(values['amount'])
+            refund_quote(inv['amount'],0,previous,amount)
+            return {'op':operation,'invoice_id':iid,'amount':amount},{'invoice_id':iid,'merchant_account':str(inv['merchant_account']),'payer_account':str(inv['payer_account']),'amount':amount,'currency':'UZS'}
+        if previous:raise PaymentError('use_amount_refund_for_remaining',409)
         payload={'op':operation,'invoice_id':iid}
     else:raise PaymentError('invalid_operation',422)
     return payload,{'invoice_id':iid,'merchant_account':str(inv['merchant_account']),'amount':inv['amount'],'currency':'UZS'}

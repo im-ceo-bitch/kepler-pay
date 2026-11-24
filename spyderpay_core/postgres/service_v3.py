@@ -17,16 +17,18 @@ class Credential:
     not_after: int
 
 
+V3_ROLES={'ops','monitor','bank_ops','bank_review','bank_callback','bank_statement','risk_ops','compliance_maker','compliance_review','clearing_review','bank_consent','bank_dispatch','fee_maker','fee_review','dispute_maker','dispute_review','dispute_execute'}
+
 def load_credentials(raw: str) -> dict:
     items=json.loads(raw)
-    keys=load_keys(raw)
+    keys=load_keys(raw,allowed_roles=V3_ROLES)
     out={}
     secrets_seen=set()
     actor_roles={}
     for item in items:
         kid=item['key_id']; k=keys[kid]
         start,end=item['not_before'],item['not_after']
-        if len(k.principal.roles)!=1 or not k.principal.roles <= {'ops','bank_ops','bank_review','bank_callback','bank_statement','risk_ops'} or type(start) is not int or type(end) is not int or not 0<end-start<=90*86400 or k.secret in secrets_seen:
+        if len(k.principal.roles)!=1 or not k.principal.roles <= V3_ROLES or type(start) is not int or type(end) is not int or not 0<end-start<=90*86400 or k.secret in secrets_seen:
             raise ValueError('invalid_service_credential_scope_or_lifetime')
         actor=(k.principal.tenant_id,k.principal.subject)
         if actor in actor_roles and actor_roles[actor]!=k.principal.roles:raise ValueError("service_actor_role_conflict")

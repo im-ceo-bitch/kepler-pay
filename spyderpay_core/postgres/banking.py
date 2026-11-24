@@ -83,6 +83,11 @@ class Banking:
         data={'op':'bank_create','account':account,'direction':direction,'provider':provider_id,'amount':amount,'beneficiary_ref':beneficiary_ref,'consent_ref':consent_ref}
         def run(conn):
             self._risk(conn,p,account)
+            from .compliance import Compliance
+            Compliance(self.p).enforce(conn,p,account,amount)
+            consent=conn.execute('SELECT * FROM sp_bank_consents WHERE tenant_id=%s AND consent_ref=%s',(p.tenant_id,consent_ref)).fetchone()
+            from .consent import check_consent
+            check_consent(consent,account,provider_id,direction,amount,beneficiary_ref,p.subject,datetime.now(timezone.utc))
             row=conn.execute('''INSERT INTO sp_bank_intents(tenant_id,account_id,direction,provider,amount,beneficiary_ref,consent_ref,created_by)
               VALUES(%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING RETURNING *''',(p.tenant_id,account,direction,provider_id,amount,beneficiary_ref,consent_ref,p.subject)).fetchone()
             if not row:raise PaymentError('bank_consent_already_used',409)
@@ -109,12 +114,21 @@ class Banking:
         self.p._outbox(conn,p,'bank.intent.'+new_state,iid,{'intent_id':iid,'state':new_state,'direction':intent['direction']})
         return result
 
+    @staticmethod
+    def _require_consent(conn,p,i):
+        from .consent import check_consent
+        c=conn.execute('SELECT * FROM sp_bank_consents WHERE tenant_id=%s AND consent_ref=%s',(p.tenant_id,i['consent_ref'])).fetchone()
+        check_consent(c,str(i['account_id']),i['provider'],i['direction'],i['amount'],i['beneficiary_ref'],i['created_by'],datetime.now(timezone.utc))
+
     def review(self,p,iid,idem):
         authorize_role(p,'bank_review');iid=_id(iid)
         def run(conn):
             i=self._intent(conn,p,iid)
             if i['state']!='created' or i['created_by']==p.subject:raise PaymentError('independent_review_required',409)
             self._risk(conn,p,str(i['account_id']))
+            from .compliance import Compliance
+            Compliance(self.p).enforce(conn,p,str(i['account_id']),i['amount'],iid)
+            self._require_consent(conn,p,i)
             hold=journal=None
             if i['direction']=='withdrawal':
                 hold=self._system(conn,p,'hold:'+iid)
@@ -131,6 +145,9 @@ class Banking:
             i=self._intent(conn,p,iid)
             if i['state']!='authorized':raise PaymentError('bank_not_authorized',409)
             self._risk(conn,p,str(i['account_id']))
+            from .compliance import Compliance
+            Compliance(self.p).enforce(conn,p,str(i['account_id']),i['amount'],iid)
+            self._require_consent(conn,p,i)
             # Serialize provider reference allocation and detect reuse before unique constraint.
             conn.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',(p.tenant_id+':'+i['provider']+':'+external,))
             if conn.execute('SELECT 1 FROM sp_bank_intents WHERE tenant_id=%s AND provider=%s AND provider_ref=%s',(p.tenant_id,i['provider'],external)).fetchone():raise PaymentError('bank_provider_reference_reused',409)
@@ -188,6 +205,7 @@ class Banking:
             d={str(r['id']):r for r in rows}
             if callback_id not in d or statement_id not in d:raise PaymentError('bank_evidence_missing',404)
             status=verify_match(i,d[callback_id],d[statement_id])
+            if not conn.execute('SELECT 1 FROM sp_statement_rows r JOIN sp_statement_approvals a ON a.batch_id=r.batch_id WHERE r.evidence_id=%s',(statement_id,)).fetchone():raise PaymentError('reviewed_statement_required',409)
             if p.subject in {d[callback_id]['actor'],d[statement_id]['actor']}:raise PaymentError('independent_reviewer_required',409)
             # All known terminal evidence for the same reference must agree. No cherry picking.
             conflict=conn.execute('''SELECT 1 FROM sp_bank_evidence WHERE tenant_id=%s AND provider=%s AND provider_ref=%s AND
@@ -201,6 +219,8 @@ class Banking:
             elif i['direction']=='deposit':
                 # Credits require matched evidence AND still-approved risk. Frozen account goes to exception workflow.
                 self._risk(conn,p,str(i['account_id']))
+                from .compliance import Compliance
+                Compliance(self.p).enforce(conn,p,str(i['account_id']),i['amount'],iid)
                 clearing=self._system(conn,p,'clearing:'+i['provider'])
                 src,dst=self.p._lock_accounts(conn,clearing,str(i['account_id']))
                 journal=self.p._post(conn,p,'bank_deposit',src,dst,i['amount'],iid)

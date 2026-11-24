@@ -1,0 +1,33 @@
+[Unit]
+Description=SpyderPay signed read-only pre-license operational monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=spyderpay-monitor
+Group=spyderpay-monitor
+WorkingDirectory=/opt/spyderpay
+EnvironmentFile=/etc/spyderpay/monitor.env
+Environment=SPYDERPAY_ENV=prelicense
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/spyderpay/venv/bin/python -m spyderpay_core.postgres.ops.monitor
+TimeoutStartSec=20
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+TasksMax=16
+MemoryMax=128M
+StandardOutput=journal
+StandardError=journal

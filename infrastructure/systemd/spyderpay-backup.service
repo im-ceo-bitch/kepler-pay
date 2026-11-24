@@ -1,0 +1,32 @@
+[Unit]
+Description=SpyderPay encrypted pre-license logical backup
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=spyderpay-backup
+Group=spyderpay-backup
+EnvironmentFile=/etc/spyderpay/backup.env
+Environment=SPYDERPAY_ENV=prelicense
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/spyderpay/venv/bin/python -m spyderpay_core.postgres.ops.backup /var/lib/spyderpay-backup
+StateDirectory=spyderpay-backup
+StateDirectoryMode=0700
+TimeoutStartSec=3900
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+ReadWritePaths=/var/lib/spyderpay-backup
+StandardOutput=journal
+StandardError=journal

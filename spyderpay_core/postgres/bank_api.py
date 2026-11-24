@@ -4,6 +4,7 @@ from fastapi import Header, Request
 from pydantic import StrictInt, Field
 from .api import _Base
 from .banking import Banking
+from spyderpay_core.ledger import PaymentError
 
 Idem=Annotated[str,Header(min_length=12,max_length=128)]
 Ref=Annotated[str,Field(min_length=3,max_length=96)]
@@ -65,16 +66,17 @@ def mount_bank_routes(app,processor):
     def review(request: Request,iid: str,data: _Base,idempotency_key: Idem):return bank.review(actor(request),iid,idempotency_key)
 
     @app.post('/v3/bank/intents/{iid}/submit')
-    def submit(request: Request,iid: str,data: Submit,idempotency_key: Idem):return bank.submit(actor(request),iid,data.provider_ref,idempotency_key)
+    def submit(request: Request,iid: str,data: Submit,idempotency_key: Idem):raise PaymentError('legacy_bank_submit_disabled_use_dispatch_claim',409)
 
     @app.post('/v3/bank/intents/{iid}/unknown')
-    def unknown(request: Request,iid: str,data: _Base,idempotency_key: Idem):return bank.unknown(actor(request),iid,idempotency_key)
+    def unknown(request: Request,iid: str,data: _Base,idempotency_key: Idem):raise PaymentError('legacy_bank_unknown_disabled_use_dispatch_result',409)
 
     @app.post('/v3/bank/intents/{iid}/cancel')
     def cancel(request: Request,iid: str,data: _Base,idempotency_key: Idem):return bank.cancel(actor(request),iid,idempotency_key)
 
     @app.post('/v3/bank/evidence/{channel}')
     def evidence(request: Request,channel: Literal['callback','statement'],data: Evidence,idempotency_key: Idem):
+        if channel=='statement':raise PaymentError('statement_batch_required',409)
         return bank.evidence(actor(request),channel,data.provider,data.event_ref,data.provider_ref,data.direction,data.amount,data.beneficiary_ref,data.status,data.payload_digest,idempotency_key)
 
     @app.post('/v3/bank/intents/{iid}/settle')

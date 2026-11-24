@@ -29,8 +29,10 @@ class ServiceKey:
     principal: Principal
 
 
-def load_keys(raw: str) -> dict[str,ServiceKey]:
+def load_keys(raw: str, *, allowed_roles=None) -> dict[str,ServiceKey]:
     """JSON loaded from a secret manager, never version-controlled."""
+    if allowed_roles is None:
+        allowed_roles={'ops','customer','merchant','bank_ops','bank_review','bank_callback','bank_statement','risk_ops'}
     keys=json.loads(raw)
     if not isinstance(keys,list) or not keys or len(keys)>100:
         raise ValueError('expected nonempty array of service principals')
@@ -41,7 +43,7 @@ def load_keys(raw: str) -> dict[str,ServiceKey]:
         secret=base64.b64decode(encoded,validate=True)
         if len(secret)<32 or len(secret)>128:raise ValueError('service key length must be 32..128 bytes')
         roles=item['roles']; tenant=item['tenant_id']; subject=item['subject']
-        if not isinstance(roles,list) or not roles or not set(roles)<={'ops','customer','merchant','bank_ops','bank_review','bank_callback','bank_statement','risk_ops'}:
+        if not isinstance(roles,list) or not roles or not set(roles)<=allowed_roles:
             raise ValueError('invalid service roles')
         from .store import _identity
         out[kid]=ServiceKey(secret,Principal(kid,_identity(tenant),_identity(subject),frozenset(roles)))

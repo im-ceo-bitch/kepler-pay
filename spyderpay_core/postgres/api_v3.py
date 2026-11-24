@@ -15,6 +15,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from spyderpay_core.ledger import PaymentError
+from spyderpay_core.release import VERSION, SCHEMA_VERSION
 from .api import _Base, AccountCreate, Transfer, InvoiceCreate, Pay, Freeze, Credit
 from .auth import PostgresNonceStore
 from .identity import OIDCVerifier, resolve_principal, assert_membership, issue_approval, confirm_approval
@@ -24,7 +25,7 @@ from .store import PgProcessor, KEY_RE, _id, _jsonable
 MAX_BODY=16384
 TARGET=re.compile(rb'/[A-Za-z0-9/_-]{1,220}')
 CRITICAL={b'authorization',b'idempotency-key',b'x-spyder-key-id',b'x-spyder-timestamp',b'x-spyder-nonce',b'x-spyder-signature',b'x-spyder-approval',b'content-type',b'content-length',b'host',b'transfer-encoding'}
-MONEY_ROUTES={'transfer','pay_invoice','refund_invoice'}
+MONEY_ROUTES={'transfer','pay_invoice','refund_invoice','refund_amount'}
 
 
 class TransferApproval(_Base):
@@ -49,7 +50,23 @@ class RefundApproval(_Base):
     expected_merchant: str
 
 
-Approval=Annotated[Union[TransferApproval,InvoiceApproval,RefundApproval],Field(discriminator='operation')]
+class AmountRefundApproval(_Base):
+    operation: Literal['refund_amount']
+    invoice_id: str
+    expected_amount: StrictInt = Field(gt=0)
+    expected_merchant: str
+    amount: StrictInt = Field(gt=0)
+
+
+class AmountRefund(_Base):
+    amount: StrictInt = Field(gt=0)
+
+
+class PosPreview(_Base):
+    token: str = Field(min_length=1,max_length=2048)
+
+
+Approval=Annotated[Union[TransferApproval,InvoiceApproval,RefundApproval,AmountRefundApproval],Field(discriminator='operation')]
 Idem=Annotated[str,Header(min_length=12,max_length=128)]
 
 
@@ -102,12 +119,12 @@ class IdentityRateLimit:
             if row['hits']>90:raise PaymentError('rate_limited',429)
 
 
-def create_app(processor: PgProcessor, service_config: str, oidc_config: str, *, allow_sandbox_credit=False):
+def create_app(processor: PgProcessor, service_config: str, oidc_config: str, *, allow_sandbox_credit=False, pos_config=None):
     credentials=load_credentials(service_config)
     verifier=OIDCVerifier(oidc_config)
     nonces=PostgresNonceStore(processor)
     rate=IdentityRateLimit(processor)
-    app=FastAPI(title='SpyderPay pre-license API',version='0.4.0',docs_url=None,redoc_url=None,openapi_url=None,redirect_slashes=False)
+    app=FastAPI(title='SpyderPay pre-license API',version=VERSION,docs_url=None,redoc_url=None,openapi_url=None,redirect_slashes=False)
     slots=asyncio.Semaphore(24)
 
     @app.exception_handler(PaymentError)
@@ -141,13 +158,15 @@ def create_app(processor: PgProcessor, service_config: str, oidc_config: str, *,
         try:
             target=_check_request(request)
             if target=='/health/live' and request.method=='GET':return _headers(await call_next(request),rid)
-            if not target.startswith('/v3/'):
+            readiness=target=='/health/ready' and request.method=='GET'
+            if not readiness and not target.startswith('/v3/'):
                 return _headers(_response('not_found',404),rid)
             try:
                 await asyncio.wait_for(slots.acquire(),timeout=0.2)
                 acquired=True
             except TimeoutError:
                 return _headers(_response('overloaded',503),rid)
+            if readiness:return _headers(await call_next(request),rid)
             data=bytearray()
             async with asyncio.timeout(5):
                 async for chunk in request.stream():
@@ -173,6 +192,8 @@ def create_app(processor: PgProcessor, service_config: str, oidc_config: str, *,
                 except (ValueError,UnicodeError,RecursionError):raise PaymentError('invalid_json',400) from None
             request._body=body
             request.state.principal=await run_in_threadpool(authenticate,request,target,body)
+            if request.state.principal.roles==frozenset({'monitor'}) and not (request.method=='GET' and target in ('/v3/ops/health','/v3/ops/ready')):
+                raise PaymentError('monitor_route_forbidden',403)
             result=await call_next(request)
         except PaymentError as ex:
             result=_response(ex.code,ex.status)
@@ -185,6 +206,9 @@ def create_app(processor: PgProcessor, service_config: str, oidc_config: str, *,
             result=_response('temporarily_unavailable',503)
         finally:
             if acquired:slots.release()
+        if result.status_code in (401,403,409,429,503):
+            import logging
+            logging.getLogger('spyderpay.security').info('boundary_event request_id=%s status=%d',rid,result.status_code)
         return _headers(result,rid)
 
     def actor(request):return request.state.principal
@@ -199,16 +223,31 @@ def create_app(processor: PgProcessor, service_config: str, oidc_config: str, *,
         p.require('ops')
         return p
 
+    def monitoring_actor(request):
+        p=actor(request)
+        if p.identity is not None or p.roles not in (frozenset({'ops'}),frozenset({'monitor'})):
+            raise PaymentError('monitor_service_role_required',403)
+        return p
+
     @app.get('/health/live')
     def live():return {'alive':True,'real_money':False,'api_version':3}
 
+    @app.get('/health/ready')
+    def local_ready():
+        try:
+            with processor._connect() as conn:
+                row=conn.execute('SELECT max(version) AS version, pg_is_in_recovery() AS standby FROM sp_schema_version').fetchone()
+            if not row or row['version']!=SCHEMA_VERSION or row['standby']:return _response('not_ready',503)
+        except Exception:return _response('not_ready',503)
+        return {'ready':True,'real_money':False}
+
     @app.get('/v3/ops/ready')
     def ready(request: Request):
-        operator(request)
+        monitoring_actor(request)
         with processor._connect() as conn:
             row=conn.execute('SELECT max(version) AS version FROM sp_schema_version').fetchone()
-        if row['version']!=4:raise PaymentError('schema_not_ready',503)
-        return {'ready':True,'schema':4,'real_money':False}
+        if row['version']!=SCHEMA_VERSION:raise PaymentError('schema_not_ready',503)
+        return {'ready':True,'schema':SCHEMA_VERSION,'real_money':False}
 
     @app.get('/v3/accounts')
     def accounts(request: Request):
@@ -229,6 +268,11 @@ def create_app(processor: PgProcessor, service_config: str, oidc_config: str, *,
     @app.post('/v3/ops/accounts/{account_id}/freeze')
     def freeze(request: Request,account_id: str,data: Freeze,idempotency_key: Idem):
         return processor.freeze(operator(request),account_id,data.reason,idempotency_key)
+
+    @app.get('/v3/ops/health')
+    def ops_health(request: Request):
+        from .operations import operational_snapshot
+        return operational_snapshot(processor,monitoring_actor(request))
 
     @app.get('/v3/ops/reconciliation')
     def reconciliation(request: Request):return processor.reconcile(operator(request))
@@ -278,25 +322,51 @@ def create_app(processor: PgProcessor, service_config: str, oidc_config: str, *,
     def refund(request: Request,invoice_id: str,data: _Base,idempotency_key: Idem):
         return processor.refund_invoice(user(request,'merchant'),invoice_id,idempotency_key)
 
+    @app.post('/v3/invoices/{invoice_id}/refund-amount')
+    def partial_refund(request: Request,invoice_id: str,data: AmountRefund,idempotency_key: Idem):
+        from .refunds import refund_amount
+        return refund_amount(processor,user(request,'merchant'),invoice_id,data.amount,idempotency_key)
+
     from .bank_api import mount_bank_routes
     mount_bank_routes(app,processor)
+    from .compliance_api import mount_compliance_routes
+    mount_compliance_routes(app,processor)
+    from .dispatch_api import mount_dispatch_routes
+    mount_dispatch_routes(app,processor)
+    from .financial_api import mount_financial_routes
+    mount_financial_routes(app,processor)
+    from .card_api import mount_card_routes
+    mount_card_routes(app,processor,verifier)
+    from .pos import PosTokens, issue_for_merchant, preview_for_customer
+    pos_tokens=PosTokens(pos_config) if pos_config else None
+    @app.post('/v3/pos/invoices/{iid}/token')
+    def pos_issue(request: Request,iid: str,data: _Base):
+        if pos_tokens is None:raise PaymentError('pos_not_configured',503)
+        return issue_for_merchant(processor,actor(request),pos_tokens,iid)
+
+    @app.post('/v3/pos/preview')
+    def pos_preview(request: Request,data: PosPreview):
+        if pos_tokens is None:raise PaymentError('pos_not_configured',503)
+        return preview_for_customer(processor,actor(request),pos_tokens,data.token)
     return app
 
 
 def main():
     if os.getenv('SPYDERPAY_ENV')!='prelicense':raise SystemExit('Refusing non-prelicense environment')
     dsn=os.environ['SPYDERPAY_PG_DSN']
+    import sys
+    if sys.argv[1:] not in ([],['--hardened']):raise SystemExit('invalid runtime arguments')
+    if os.getenv('SPYDERPAY_HARDENED')=='yes' or sys.argv[1:]==['--hardened']:
+        from .deployment import check_hardened
+        check_hardened(os.environ,dsn)
     processor=PgProcessor(dsn)
+    from .runtime_preflight import check_runtime
     with processor._connect() as conn:
-        version=conn.execute('SELECT max(version) AS version FROM sp_schema_version').fetchone()['version']
-        if version!=4:raise SystemExit('Migrate with a separate database owner before starting API')
-        # Application must never run as a superuser or schema owner.
-        row=conn.execute('''SELECT r.rolsuper,r.rolcreaterole,r.rolcreatedb,r.rolbypassrls,r.rolreplication,
-           pg_has_role(current_user,c.relowner,'MEMBER') AS owns_ledger
-           FROM pg_roles r JOIN pg_class c ON c.oid='sp_journals'::regclass WHERE r.rolname=current_user''').fetchone()
-        if any(row.values()):raise SystemExit('Unsafe database runtime role')
-    app=create_app(processor,os.environ['SPYDERPAY_SERVICE_KEYS_JSON'],os.environ['SPYDERPAY_OIDC_JSON'],allow_sandbox_credit=os.getenv('SPYDERPAY_ALLOW_SANDBOX_CREDIT')=='yes')
+        check_runtime(conn)
+    app=create_app(processor,os.environ['SPYDERPAY_SERVICE_KEYS_JSON'],os.environ['SPYDERPAY_OIDC_JSON'],allow_sandbox_credit=os.getenv('SPYDERPAY_ALLOW_SANDBOX_CREDIT')=='yes',pos_config=os.getenv('SPYDERPAY_POS_KEYS_JSON'))
+    import logging
+    logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(name)s %(message)s')
     import uvicorn
-    uvicorn.run(app,host='127.0.0.1',port=int(os.getenv('PORT','8766')),access_log=False,proxy_headers=False,server_header=False,timeout_keep_alive=3,limit_concurrency=32)
+    uvicorn.run(app,host='127.0.0.1',port=int(os.getenv('PORT','8766')),access_log=False,proxy_headers=False,server_header=False,timeout_keep_alive=3,limit_concurrency=32,timeout_graceful_shutdown=20)
 
 if __name__=='__main__':main()

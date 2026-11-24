@@ -233,3 +233,25 @@ def test_signed_bank_role_routes_only_to_bank(oidc,svc):
             assert call.call_args.args[0].roles==frozenset({'bank_ops'})
             other='/v3/ops/accounts';payload=b'{"owner_id":"abc","kind":"customer"}'
             assert c.post(other,content=payload,headers=headers(sec,now,other,payload)).status_code==403
+
+
+def test_v9_card_endpoints_reject_service_identity(client):
+    c,_,secret,now=client;path='/v3/cards/enroll';body=json.dumps({'public_key':'04'+'a'*128}).encode()
+    assert c.post(path,content=body,headers=headers(secret,now,path,body)).status_code==403
+
+
+def test_v9_card_preview_is_not_payment_authorization(client):
+    c,tok,*_=client;cid='00000000-0000-4000-8000-000000000001';iid='00000000-0000-4000-8000-000000000002'
+    auth={'Authorization':'Bearer '+tok()}
+    with patch('spyderpay_core.postgres.cards.Cards.begin_preview',return_value={'payment_authority':False,'sandbox':True}) as m:
+        response=c.post(f'/v3/cards/{cid}/preview',json={'invoice_id':iid},headers=auth)
+        assert response.status_code==200 and response.json()['payment_authority'] is False
+        assert m.call_args.args[0].subject=='server-mapped-owner'
+    assert c.post(f'/v3/cards/{cid}/pay',json={'invoice_id':iid},headers=auth).status_code==404
+
+
+def test_v9_local_readiness_fails_closed_without_db(client):
+    c,*_=client
+    assert c.get('/health/live').status_code==200
+    response=c.get('/health/ready');assert response.status_code==503 and response.json()=={'error':'not_ready'}
+    assert response.headers['cache-control']=='no-store'

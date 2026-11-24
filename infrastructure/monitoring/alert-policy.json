@@ -1,0 +1,8 @@
+{
+  "scope": "private prelicense staging only",
+  "critical": ["invalid_journals", "invalid_balances", "invalid_holds", "invalid_posting_scope", "invalid_fees", "invalid_chargebacks", "schema_mismatch"],
+  "degraded": ["stale_bank_intents", "stale_outbox", "stale_statements", "stale_dispatch", "exhausted_outbox", "conflicting_bank_evidence", "unmatched_bank_evidence", "stale_chargebacks"],
+  "actions": {"critical": "page two independent incident operators; pause financial traffic and verify evidence", "degraded": "investigate; never duplicate external payment"},
+  "slo_targets_not_verified": {"api_availability_percent": 99.9, "p95_read_ms": 500, "backup_restore_drill_interval_days": 30},
+  "notes": "Do not expose tenant operational endpoints publicly. Ship logs with access controls, redaction, retention and external tamper-resistant storage. Test alert routing and load in staging."
+}

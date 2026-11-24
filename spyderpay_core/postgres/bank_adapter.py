@@ -44,7 +44,14 @@ class ExampleHmacCallbackVerifier:
         return hmac.new(secret,timestamp.encode()+b'.'+body,hashlib.sha256).hexdigest()
 
     def verify_callback(self,raw_body:bytes,headers:dict[str,str],now:int | None=None)->BankEvidence:
-        norm={k.lower():v for k,v in headers.items()}
+        if not isinstance(raw_body,bytes) or len(raw_body)>16384:
+            raise PaymentError('invalid_bank_event',422)
+        norm={}
+        for k,v in headers.items():
+            key=k.lower()
+            if key in norm:
+                raise PaymentError('ambiguous_bank_headers',400)
+            norm[key]=v
         timestamp=norm.get('x-example-bank-timestamp','')
         signature=norm.get('x-example-bank-signature','')
         if not re.fullmatch('[0-9]{10}',timestamp) or not re.fullmatch('[0-9a-f]{64}',signature):
@@ -54,7 +61,14 @@ class ExampleHmacCallbackVerifier:
         if not hmac.compare_digest(self.signature(self.secret,raw_body,timestamp),signature):
             raise PaymentError('invalid_bank_signature',401)
         try:
-            obj=json.loads(raw_body)
+            def pairs(entries):
+                out={}
+                for k,v in entries:
+                    if k in out:raise ValueError('duplicate_key')
+                    out[k]=v
+                return out
+            def constant(_):raise ValueError('nonfinite_json')
+            obj=json.loads(raw_body.decode('utf-8'),object_pairs_hook=pairs,parse_constant=constant)
             if not isinstance(obj,dict) or set(obj)!={'external_id','amount_uzs','status','receiver_reference'}:
                 raise ValueError()
             ext=obj['external_id'];amt=obj['amount_uzs'];status=obj['status'];ref=obj['receiver_reference']
@@ -62,6 +76,6 @@ class ExampleHmacCallbackVerifier:
             if type(amt) is not int or not 0<amt<=100_000_000:raise ValueError()
             if status not in ('pending','confirmed','reversed'):raise ValueError()
             if not isinstance(ref,str) or not 3<=len(ref)<=128:raise ValueError()
-        except (ValueError,TypeError,KeyError):
+        except (ValueError,TypeError,KeyError,RecursionError):
             raise PaymentError('invalid_bank_event',422) from None
         return BankEvidence(self.provider_id,ext,amt,status,ref)

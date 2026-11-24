@@ -5,6 +5,8 @@ BEGIN;
 DO $$ BEGIN
  IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='spyderpay_runtime') THEN CREATE ROLE spyderpay_runtime NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS; END IF;
  IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='spyderpay_identity_admin') THEN CREATE ROLE spyderpay_identity_admin NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS; END IF;
+ IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='spyderpay_incident_maker') THEN CREATE ROLE spyderpay_incident_maker NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS; END IF;
+ IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='spyderpay_incident_reviewer') THEN CREATE ROLE spyderpay_incident_reviewer NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS; END IF;
 END $$;
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 GRANT USAGE ON SCHEMA public TO spyderpay_runtime,spyderpay_identity_admin;
@@ -30,4 +32,26 @@ GRANT INSERT(tenant_id,provider,channel,event_ref,provider_ref,status,direction,
 GRANT INSERT(evidence_id,intent_id,channel) ON sp_bank_evidence_use TO spyderpay_runtime;
 GRANT INSERT(tenant_id,intent_id,reason,opened_by),UPDATE(state,resolution,closed_by,closed_at) ON sp_bank_cases TO spyderpay_runtime;
 -- Intentionally no TRUNCATE, DELETE on financial records, or DDL rights for runtime.
+GRANT SELECT,INSERT ON sp_compliance_reviews,sp_compliance_decisions,sp_statement_batches,sp_statement_rows,sp_statement_approvals,sp_bank_consents TO spyderpay_runtime;
+GRANT SELECT ON sp_rail_dispatch,sp_rail_dispatch_result TO spyderpay_runtime;
+GRANT INSERT(intent_id,tenant_id,request_ref,instruction_digest,actor) ON sp_rail_dispatch TO spyderpay_runtime;
+GRANT INSERT(intent_id,actor,outcome) ON sp_rail_dispatch_result TO spyderpay_runtime;
+GRANT SELECT ON sp_fee_schedules,sp_fee_approvals,sp_invoice_fees,sp_fee_movements,sp_chargebacks,sp_chargeback_decisions,sp_chargeback_executions TO spyderpay_runtime;
+GRANT INSERT(tenant_id,merchant_account,bps,maker,evidence_ref) ON sp_fee_schedules TO spyderpay_runtime;
+GRANT INSERT(schedule_id,reviewer) ON sp_fee_approvals TO spyderpay_runtime;
+GRANT INSERT(invoice_id,schedule_id,amount) ON sp_invoice_fees TO spyderpay_runtime;
+GRANT INSERT(invoice_id,direction,journal_id) ON sp_fee_movements TO spyderpay_runtime;
+GRANT INSERT(invoice_id,tenant_id,maker,reason,evidence_ref) ON sp_chargebacks TO spyderpay_runtime;
+GRANT INSERT(case_id,reviewer,decision,evidence_ref) ON sp_chargeback_decisions TO spyderpay_runtime;
+GRANT INSERT(case_id,executor,journal_id) ON sp_chargeback_executions TO spyderpay_runtime;
+GRANT SELECT ON sp_amount_refunds,sp_refund_integrity TO spyderpay_runtime;
+GRANT INSERT(invoice_id,amount,fee_amount,journal_id,fee_journal_id,case_id) ON sp_amount_refunds TO spyderpay_runtime;
+GRANT SELECT ON sp_cards,sp_card_challenges TO spyderpay_runtime;
+GRANT INSERT(id,tenant_id,owner_id,public_key),UPDATE(revoked_at) ON sp_cards TO spyderpay_runtime;
+GRANT INSERT(id,tenant_id,owner_id,issuer,external_sub,sid,card_id,purpose,public_key,nonce,invoice_id,merchant_account,amount,expires_at),UPDATE(consumed_at) ON sp_card_challenges TO spyderpay_runtime;
+GRANT SELECT ON sp_runtime_gate TO spyderpay_runtime;
+GRANT EXECUTE ON FUNCTION sp_gate_open() TO spyderpay_runtime;
+GRANT USAGE ON SCHEMA public TO spyderpay_incident_maker,spyderpay_incident_reviewer;
+GRANT EXECUTE ON FUNCTION sp_gate_pause(text),sp_gate_propose_resume(text) TO spyderpay_incident_maker;
+GRANT EXECUTE ON FUNCTION sp_gate_confirm_resume(uuid,text) TO spyderpay_incident_reviewer;
 COMMIT;
